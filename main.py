@@ -262,6 +262,8 @@ def _prepare_features_docker(df: pd.DataFrame) -> pd.DataFrame:
     d["Lag7"]       = d.groupby("ID mall")["Real"].shift(7)
     return d
 
+# NOUVEAU CODE AMÉLIORÉ AVEC LOGS DÉTAILLÉS
+
 def _predict_per_mall_rolling_into_master(df_master: pd.DataFrame) -> pd.DataFrame:
     """
     Inférence par semaines (hebdo) :
@@ -272,6 +274,7 @@ def _predict_per_mall_rolling_into_master(df_master: pd.DataFrame) -> pd.DataFra
     d = _prepare_features_docker(df_master)
     preds_all = []
 
+    log.info("--- Début de la phase de prédiction ---")
     for mall_id, g in d.groupby("ID mall"):
         g = g.copy()
 
@@ -280,6 +283,9 @@ def _predict_per_mall_rolling_into_master(df_master: pd.DataFrame) -> pd.DataFra
         if train_mask.sum() < 20:
             log.warning("Mall %s : série trop courte (%d pts), ignoré.", mall_id, train_mask.sum())
             continue
+
+        # --- AJOUT DE LOG ---
+        log.info("Mall %s : Entraînement du modèle sur %d points de données...", mall_id, train_mask.sum())
 
         model = XGBRegressor(
             n_estimators=200, max_depth=6, learning_rate=0.1,
@@ -295,10 +301,7 @@ def _predict_per_mall_rolling_into_master(df_master: pd.DataFrame) -> pd.DataFra
 
         while week_start <= last_week_start:
             week_end = week_start + pd.Timedelta(days=6)
-
             mask_week = (g["Date"] >= week_start) & (g["Date"] <= week_end)
-
-            # <-- NOUVEAU : prédire seulement les jours 2025 sans réel
             mask_week_2025_missing = (
                 mask_week
                 & (g["Date"].dt.year == OUTPUT_YEAR)
@@ -306,15 +309,14 @@ def _predict_per_mall_rolling_into_master(df_master: pd.DataFrame) -> pd.DataFra
             )
 
             if mask_week_2025_missing.any():
+                # --- AJOUT DE LOG ---
+                log.info("  -> Mall %s : Semaine du %s, prédiction de %d jours.", mall_id, week_start.date(), mask_week_2025_missing.sum())
+
                 Xw = g.loc[mask_week_2025_missing, FEATURES_DOCKER].fillna(0).copy()
                 yhat = model.predict(Xw).astype(float)
-
-                # Fermeture -> 0
                 exc = g.loc[mask_week_2025_missing, "ExceptionalDayStatus"].to_numpy()
                 yhat[exc < 0] = 0.0
-
                 yhat = np.maximum(0, np.rint(yhat)).astype(int)
-
                 tmp = g.loc[mask_week_2025_missing, ["ID mall", "Date"]].copy()
                 tmp["donnees_predites"] = yhat
                 preds_all.append(tmp)
@@ -331,19 +333,20 @@ def _predict_per_mall_rolling_into_master(df_master: pd.DataFrame) -> pd.DataFra
 
             week_start += pd.Timedelta(days=7)
 
+    log.info("--- Fin de la phase de prédiction. %d nouvelles prédictions générées. ---", len(preds_all))
     out = df_master.copy()
     if preds_all:
         preds_df = pd.concat(preds_all, ignore_index=True)
         out = out.merge(preds_df, on=["ID mall", "Date"], how="left")
     else:
         out["donnees_predites"] = np.nan
-
-    # Sécurité : pas de prédictions < 2025
     out.loc[out["Date"].dt.year < OUTPUT_YEAR, "donnees_predites"] = np.nan
-
     return out
 
 # ====== Pipeline principal ====================================================
+# ==============================================================================
+#  VERSION FINALE ET CORRIGÉE DE LA FONCTION pipeline()
+# ==============================================================================
 def pipeline() -> None:
     log.info("ENV → DRIVE_FOLDER_ID=%s, GCS_BUCKET_NAME=%s", DRIVE_FOLDER_ID or "(none)", GCS_BUCKET_NAME or "(none)")
     if DRIVE_FOLDER_ID:
@@ -352,45 +355,29 @@ def pipeline() -> None:
     else:
         log.info("Mode local : fichiers dans ./data")
 
-    # Localisation des fichiers
-    # NOUVEAU CODE AMÉLIORÉ
+    # --- Logique de découverte de fichiers ---
     transco_p = (TMP / "Transco.xlsx") if (TMP / "Transco.xlsx").exists() else (DATA_DIR / "Transco.xlsx")
-
-    # --- Début de la logique de découverte améliorée ---
     log.info("Recherche des fichiers de flux...")
-
-    # 1. On garde la liste des fichiers officiels
     flux_candidates = ["2023 flux quotidiens.xlsx", "2024 flux quotidiens.xlsx", "2025 flux quotidiens.xlsx"]
     all_potential_files: List[Path] = []
-
     for name in flux_candidates:
-        # On cherche dans le dossier temporaire (Drive) puis dans le dossier local
         p_tmp = TMP / name
         p_data = DATA_DIR / name
         if p_tmp.exists():
             all_potential_files.append(p_tmp)
         elif p_data.exists():
             all_potential_files.append(p_data)
-
-    # 2. EN PLUS, on cherche tout autre fichier contenant "flux" (xlsx ou csv)
     for folder in [TMP, DATA_DIR]:
         all_potential_files.extend(folder.glob("*flux*.xlsx"))
         all_potential_files.extend(folder.glob("*flux*.csv"))
-
-    # 3. On s'assure que chaque fichier est unique pour éviter de lire les données en double
     if all_potential_files:
-        # Crée un dictionnaire où les clés sont les noms de fichiers, éliminant les doublons
         unique_flux_files = {p.name: p for p in all_potential_files}
-        flux_ps = list(unique_flux_files.values()) # On reconvertit en liste
+        flux_ps = list(unique_flux_files.values())
         log.info("Fichiers de flux qui seront chargés : %s", [p.name for p in flux_ps])
     else:
         flux_ps = []
-    # --- Fin de la logique de découverte ---
-
     rec_glob = list(TMP.glob("*OE*2024*")) or list(DATA_DIR.glob("*OE*2024*"))
     rec_p = rec_glob[0] if rec_glob else None
-
-
     if not transco_p.exists():
         log.error("Transco absent : %s", transco_p)
         sys.exit(1)
@@ -398,23 +385,23 @@ def pipeline() -> None:
         log.error("Aucun fichier de flux trouvé.")
         sys.exit(1)
 
-    # 1) Master
+    # 1) Création du Master Dataset
     build_master(transco_p, flux_ps, rec_p)
 
     # 2) Prédictions
     df0 = pd.read_csv(RAW_TS, parse_dates=["Date"])
     dfp = _predict_per_mall_rolling_into_master(df0)
 
-    # 3) Join transco + mapping colonnes, puis export final 5 colonnes
+    # 3) Join transco pour obtenir les noms et clusters
     tr = (pd.read_excel(transco_p) if transco_p.suffix.lower() != ".csv" else pd.read_csv(transco_p, sep=","))
     tr = tr[tr["ID mall"] != "-"].dropna(subset=["ID mall"]).copy()
     tr["ID mall"] = tr["ID mall"].astype(int)
-
     dfp = dfp.merge(tr[["ID mall", "Site", "Cluster"]], on="ID mall", how="left")
     dfp.rename(columns={"Site": "nom_mall", "Cluster": "cluster"}, inplace=True)
-
     dfp["donnees_reelles"] = dfp["Daily footfall"]
 
+    # 4) **CRÉATION INITIALE DU DATAFRAME `final`**
+    # Contient les données réelles et les NOUVELLES prédictions générées
     final = (
         dfp[["nom_mall", "cluster", "Date", "donnees_reelles", "donnees_predites"]]
         .rename(columns={"Date": "date"})
@@ -422,44 +409,70 @@ def pipeline() -> None:
         .reset_index(drop=True)
     )
 
-    # -----------------------------------------------------------------------------
-    #  CONSERVER LES PREDICTIONS DÉJÀ PUBLIÉES
-    # -----------------------------------------------------------------------------
-    # … juste avant la fusion dans pipeline() …
-
-    # 0) Si on utilise GCS, rapatrier l'ancien export dans TMP
+    # 5) **MISE À JOUR AVEC L'HISTORIQUE**
+    history_path = OUT_CSV
+    history_exists = False
     if GCS_BUCKET_NAME:
         from google.cloud import storage
         client = storage.Client()
         bucket = client.bucket(GCS_BUCKET_NAME)
-        blob = bucket.blob(f"carmila/{OUT_CSV.name}")
+        blob = bucket.blob(f"carmila/{history_path.name}")
         if blob.exists():
-            blob.download_to_filename(OUT_CSV)
-            log.info("↳ Anciennes prédictions récupérées depuis GCS → %s", OUT_CSV)
+            blob.download_to_filename(history_path)
+            log.info("↳ Anciennes prédictions récupérées depuis GCS → %s", history_path)
+            history_exists = True
 
-    # 1) Maintenant on peut vraiment fusionner l’historique
-    if OUT_CSV.exists():
-        old = pd.read_csv(OUT_CSV, sep=",", parse_dates=["date"])
-        # Garde-fou doublons
-        assert not old.duplicated(["nom_mall", "cluster", "date"]).any(), "Duplicates in historical file"
-        # Assemblage
-        final = (
-            final
-            .merge(
-                old[["nom_mall", "cluster", "date", "donnees_predites"]],
-                on=["nom_mall", "cluster", "date"],
-                how="left",
-                suffixes=("", "_old"),
-            )
-        )
-        final["donnees_predites"] = final["donnees_predites"].combine_first(final["donnees_predites_old"])
-        final.drop(columns=["donnees_predites_old"], inplace=True)
+    if history_exists:
+        log.info("--- Début de la mise à jour avec l'historique ---")
+        old_preds = pd.read_csv(history_path, sep=",", parse_dates=["date"])
+        new_preds = final[final["donnees_predites"].notna()].copy()
 
-    # 2) Écriture finale du CSV cumulatif
+        log.info("Nouvelles prédictions générées : %d", len(new_preds))
+        log.info("Anciennes prédictions (fichier GCS) : %d", old_preds["donnees_predites"].notna().sum())
+
+        # Fusion intelligente des anciennes et nouvelles prédictions
+        old_preds_indexed = old_preds.set_index(["nom_mall", "cluster", "date"])
+        new_preds_indexed = new_preds.set_index(["nom_mall", "cluster", "date"])
+
+        # Commencer avec l'historique complet
+        final_indexed = old_preds_indexed.copy()
+        
+        # Pour chaque nouvelle prédiction
+        for idx in new_preds_indexed.index:
+            if idx in old_preds_indexed.index:
+                # La ligne existe déjà dans l'historique
+                old_row = old_preds_indexed.loc[idx]
+                new_row = new_preds_indexed.loc[idx]
+                
+                # Cas 1: Si l'ancienne ligne n'avait pas de données réelles, on peut remplacer la prédiction
+                if pd.isna(old_row['donnees_reelles']):
+                    # Mettre à jour la prédiction seulement
+                    final_indexed.loc[idx, 'donnees_predites'] = new_row['donnees_predites']
+                    # Et mettre à jour les données réelles si disponibles
+                    if not pd.isna(new_row['donnees_reelles']):
+                        final_indexed.loc[idx, 'donnees_reelles'] = new_row['donnees_reelles']
+                else:
+                    # Cas 2: L'ancienne ligne avait déjà des données réelles
+                    # On garde les anciennes prédictions et on met à jour seulement les données réelles si nécessaire
+                    if not pd.isna(new_row['donnees_reelles']):
+                        final_indexed.loc[idx, 'donnees_reelles'] = new_row['donnees_reelles']
+                    # On ne touche pas aux prédictions (on garde les anciennes)
+            else:
+                # Nouvelle ligne qui n'existait pas dans l'historique - on l'ajoute
+                final_indexed.loc[idx] = new_preds_indexed.loc[idx]
+
+        # Le dataframe final est l'historique mis à jour avec la logique appropriée
+        final = final_indexed.reset_index()
+
+        log.info("Prédictions (après mise à jour) : %d valeurs non nulles.", final["donnees_predites"].notna().sum())
+        log.info("--- Fin de la mise à jour ---")
+    else:
+        log.info("Aucun historique de prédictions trouvé. Le nouveau fichier sera créé.")
+
+    # 6) Écriture et export final
     final.to_csv(OUT_CSV, index=False, sep=",", encoding="utf-8-sig")
     log.info("✅ Export local : %s (%d lignes)", OUT_CSV, len(final))
 
-    # 3) (Re)upload sur GCS pour la prochaine exécution
     if GCS_BUCKET_NAME:
         upload_to_gcs(GCS_BUCKET_NAME, OUT_CSV, f"carmila/{OUT_CSV.name}")
 
