@@ -4,11 +4,11 @@
 main.py — pipeline unifiée (stratégie d’inférence hebdo + prédire tous les jours 2025)
 - Entraîne un modèle unique par mall (un seul fit)
 - Entraînement sur tous les réels disponibles (inclut 2025 si présents)
-- Prédit tous les jours 2025 (même si un réel existe)
+- Prédit seulement les jours 2025 sans données réelles (les anciennes prédictions sont préservées)
 - Jours fermés -> prédiction = 0
 - Inférence hebdomadaire (mise à jour Lag7 semaine -> semaine suivante)
 - Périmètre de flux : filtre "Zone = centre" si colonne zone présente
-- Export : nom_mall;cluster;date;donnees_reelles;donnees_predites
+- Export cumulatif : nom_mall;cluster;date;donnees_reelles;donnees_predites
 """
 
 from __future__ import annotations
@@ -179,12 +179,12 @@ def build_master(transco_p: Path, flux_ps: List[Path], rec_p: Optional[Path]) ->
         if not p.exists():
             continue
         # lecture
-        df = (pd.read_excel(p) if p.suffix.lower() != ".csv" else pd.read_csv(p, sep=";", encoding="utf-8", errors="replace"))
+        df = (pd.read_excel(p) if p.suffix.lower() != ".csv" else pd.read_csv(p, sep=",", encoding="utf-8", errors="replace"))
         # normalisation colonnes
         colmap = {"Centre": "Site", "Mall": "Site", "Jour": "Date", "Date": "Date", "Entrées": "Real", "Entrees": "Real"}
         df.rename(columns={k: v for k, v in colmap.items() if k in df.columns}, inplace=True)
 
-        # >>> Filtre "Zone = centre" si une colonne zone existe (périmètre comme l'ancien)
+        # Filtre "Zone = centre" si une colonne zone existe
         zone_col = next((c for c in df.columns if re.search(r"zone", c, re.I)), None)
         if zone_col:
             df = df[df[zone_col].astype(str).str.contains("centre", case=False, na=False)]
@@ -264,11 +264,10 @@ def _prepare_features_docker(df: pd.DataFrame) -> pd.DataFrame:
 
 def _predict_per_mall_rolling_into_master(df_master: pd.DataFrame) -> pd.DataFrame:
     """
-    Inférence par semaines (hebdo) à la manière de l'ancien script,
-    en prédisant TOUS les jours 2025 (pas seulement les jours manquants).
-    - Fit unique par mall, sur tous les réels disponibles (incluant 2025 si présents).
-    - Jours fermés: prédiction forcée à 0.
-    - Mise à jour de Lag7 "par bloc" semaine -> semaine suivante.
+    Inférence par semaines (hebdo) :
+    - Fit unique par mall sur tous les réels disponibles
+    - On ne prédit QUE les jours 2025 encore sans réel
+    - Les anciennes prédictions ne sont donc jamais ré-écrasées
     """
     d = _prepare_features_docker(df_master)
     preds_all = []
@@ -299,20 +298,24 @@ def _predict_per_mall_rolling_into_master(df_master: pd.DataFrame) -> pd.DataFra
 
             mask_week = (g["Date"] >= week_start) & (g["Date"] <= week_end)
 
-            # >>> NEW: prédire TOUTE la semaine 2025, pas seulement les trous
-            mask_week_2025_all = mask_week & (g["Date"].dt.year == OUTPUT_YEAR)
+            # <-- NOUVEAU : prédire seulement les jours 2025 sans réel
+            mask_week_2025_missing = (
+                mask_week
+                & (g["Date"].dt.year == OUTPUT_YEAR)
+                & (g["Real"].isna())
+            )
 
-            if mask_week_2025_all.any():
-                Xw = g.loc[mask_week_2025_all, FEATURES_DOCKER].fillna(0).copy()
+            if mask_week_2025_missing.any():
+                Xw = g.loc[mask_week_2025_missing, FEATURES_DOCKER].fillna(0).copy()
                 yhat = model.predict(Xw).astype(float)
 
                 # Fermeture -> 0
-                exc = g.loc[mask_week_2025_all, "ExceptionalDayStatus"].to_numpy()
+                exc = g.loc[mask_week_2025_missing, "ExceptionalDayStatus"].to_numpy()
                 yhat[exc < 0] = 0.0
 
                 yhat = np.maximum(0, np.rint(yhat)).astype(int)
 
-                tmp = g.loc[mask_week_2025_all, ["ID mall", "Date"]].copy()
+                tmp = g.loc[mask_week_2025_missing, ["ID mall", "Date"]].copy()
                 tmp["donnees_predites"] = yhat
                 preds_all.append(tmp)
 
@@ -337,9 +340,6 @@ def _predict_per_mall_rolling_into_master(df_master: pd.DataFrame) -> pd.DataFra
 
     # Sécurité : pas de prédictions < 2025
     out.loc[out["Date"].dt.year < OUTPUT_YEAR, "donnees_predites"] = np.nan
-
-    # (IMPORTANT) On NE supprime PAS les prédictions quand un réel existe.
-    # => Les deux colonnes coexistent en 2025.
 
     return out
 
@@ -389,7 +389,6 @@ def pipeline() -> None:
     dfp = dfp.merge(tr[["ID mall", "Site", "Cluster"]], on="ID mall", how="left")
     dfp.rename(columns={"Site": "nom_mall", "Cluster": "cluster"}, inplace=True)
 
-    # Colonnes finales
     dfp["donnees_reelles"] = dfp["Daily footfall"]
 
     final = (
@@ -399,11 +398,47 @@ def pipeline() -> None:
         .reset_index(drop=True)
     )
 
-    final.to_csv(OUT_CSV, index=False, sep=";", encoding="utf-8-sig")
+    # -----------------------------------------------------------------------------
+    #  CONSERVER LES PREDICTIONS DÉJÀ PUBLIÉES
+    # -----------------------------------------------------------------------------
+    # … juste avant la fusion dans pipeline() …
+
+    # 0) Si on utilise GCS, rapatrier l'ancien export dans TMP
+    if GCS_BUCKET_NAME:
+        from google.cloud import storage
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET_NAME)
+        blob = bucket.blob(f"carmila/{OUT_CSV.name}")
+        if blob.exists():
+            blob.download_to_filename(OUT_CSV)
+            log.info("↳ Anciennes prédictions récupérées depuis GCS → %s", OUT_CSV)
+
+    # 1) Maintenant on peut vraiment fusionner l’historique
+    if OUT_CSV.exists():
+        old = pd.read_csv(OUT_CSV, sep=";", parse_dates=["date"])
+        # Garde-fou doublons
+        assert not old.duplicated(["nom_mall", "cluster", "date"]).any(), "Duplicates in historical file"
+        # Assemblage
+        final = (
+            final
+            .merge(
+                old[["nom_mall", "cluster", "date", "donnees_predites"]],
+                on=["nom_mall", "cluster", "date"],
+                how="left",
+                suffixes=("", "_old"),
+            )
+        )
+        final["donnees_predites"] = final["donnees_predites"].combine_first(final["donnees_predites_old"])
+        final.drop(columns=["donnees_predites_old"], inplace=True)
+
+    # 2) Écriture finale du CSV cumulatif
+    final.to_csv(OUT_CSV, index=False, sep=",", encoding="utf-8-sig")
     log.info("✅ Export local : %s (%d lignes)", OUT_CSV, len(final))
 
+    # 3) (Re)upload sur GCS pour la prochaine exécution
     if GCS_BUCKET_NAME:
         upload_to_gcs(GCS_BUCKET_NAME, OUT_CSV, f"carmila/{OUT_CSV.name}")
+
 
 # — Entry point ----------------------------------------------------------------
 if __name__ == "__main__":
