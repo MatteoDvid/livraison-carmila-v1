@@ -165,7 +165,7 @@ def parse_recensement(rec_path: Path) -> Dict:
 
 # — Création du master dataset -------------------------------------------------
 def build_master(transco_p: Path, flux_ps: List[Path], rec_p: Optional[Path]) -> None:
-    tr = (pd.read_excel(transco_p) if transco_p.suffix.lower() != ".csv" else pd.read_csv(transco_p, sep=";"))
+    tr = (pd.read_excel(transco_p) if transco_p.suffix.lower() != ".csv" else pd.read_csv(transco_p, sep=","))
     required = {"ID mall", "Site", "Cluster"}
     if missing := required.difference(tr.columns):
         log.error("Transco sans colonnes %s", ", ".join(missing))
@@ -353,19 +353,43 @@ def pipeline() -> None:
         log.info("Mode local : fichiers dans ./data")
 
     # Localisation des fichiers
+    # NOUVEAU CODE AMÉLIORÉ
     transco_p = (TMP / "Transco.xlsx") if (TMP / "Transco.xlsx").exists() else (DATA_DIR / "Transco.xlsx")
 
+    # --- Début de la logique de découverte améliorée ---
+    log.info("Recherche des fichiers de flux...")
+
+    # 1. On garde la liste des fichiers officiels
     flux_candidates = ["2023 flux quotidiens.xlsx", "2024 flux quotidiens.xlsx", "2025 flux quotidiens.xlsx"]
-    flux_ps: List[Path] = []
+    all_potential_files: List[Path] = []
+
     for name in flux_candidates:
-        p = (TMP / name) if (TMP / name).exists() else (DATA_DIR / name)
-        if p.exists():
-            flux_ps.append(p)
-        else:
-            log.warning("Fichier flux non trouvé et ignoré : %s", p)
+        # On cherche dans le dossier temporaire (Drive) puis dans le dossier local
+        p_tmp = TMP / name
+        p_data = DATA_DIR / name
+        if p_tmp.exists():
+            all_potential_files.append(p_tmp)
+        elif p_data.exists():
+            all_potential_files.append(p_data)
+
+    # 2. EN PLUS, on cherche tout autre fichier contenant "flux" (xlsx ou csv)
+    for folder in [TMP, DATA_DIR]:
+        all_potential_files.extend(folder.glob("*flux*.xlsx"))
+        all_potential_files.extend(folder.glob("*flux*.csv"))
+
+    # 3. On s'assure que chaque fichier est unique pour éviter de lire les données en double
+    if all_potential_files:
+        # Crée un dictionnaire où les clés sont les noms de fichiers, éliminant les doublons
+        unique_flux_files = {p.name: p for p in all_potential_files}
+        flux_ps = list(unique_flux_files.values()) # On reconvertit en liste
+        log.info("Fichiers de flux qui seront chargés : %s", [p.name for p in flux_ps])
+    else:
+        flux_ps = []
+    # --- Fin de la logique de découverte ---
 
     rec_glob = list(TMP.glob("*OE*2024*")) or list(DATA_DIR.glob("*OE*2024*"))
     rec_p = rec_glob[0] if rec_glob else None
+
 
     if not transco_p.exists():
         log.error("Transco absent : %s", transco_p)
@@ -382,7 +406,7 @@ def pipeline() -> None:
     dfp = _predict_per_mall_rolling_into_master(df0)
 
     # 3) Join transco + mapping colonnes, puis export final 5 colonnes
-    tr = (pd.read_excel(transco_p) if transco_p.suffix.lower() != ".csv" else pd.read_csv(transco_p, sep=";"))
+    tr = (pd.read_excel(transco_p) if transco_p.suffix.lower() != ".csv" else pd.read_csv(transco_p, sep=","))
     tr = tr[tr["ID mall"] != "-"].dropna(subset=["ID mall"]).copy()
     tr["ID mall"] = tr["ID mall"].astype(int)
 
@@ -415,7 +439,7 @@ def pipeline() -> None:
 
     # 1) Maintenant on peut vraiment fusionner l’historique
     if OUT_CSV.exists():
-        old = pd.read_csv(OUT_CSV, sep=";", parse_dates=["date"])
+        old = pd.read_csv(OUT_CSV, sep=",", parse_dates=["date"])
         # Garde-fou doublons
         assert not old.duplicated(["nom_mall", "cluster", "date"]).any(), "Duplicates in historical file"
         # Assemblage
