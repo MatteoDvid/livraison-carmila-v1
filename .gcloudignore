@@ -1,0 +1,7 @@
+# Même logique que .dockerignore
+**
+!Dockerfile
+!requirements.txt
+!main.py
+!.dockerignore
+!.gcloudignore

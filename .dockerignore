@@ -1,0 +1,8 @@
+# Ignore tout par défaut
+**
+# On whiteliste uniquement ce qui est nécessaire à l'image
+!Dockerfile
+!requirements.txt
+!main.py
+!.dockerignore
+!.gcloudignore

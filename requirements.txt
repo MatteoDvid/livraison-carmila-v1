@@ -1,0 +1,14 @@
+# Core & data
+pandas==2.2.2
+numpy==1.26.4
+openpyxl
+
+# Modeling
+xgboost==1.7.6
+scikit-learn==1.4.2
+
+# Google APIs
+google-api-python-client==2.126.0
+google-auth-httplib2
+google-auth-oauthlib
+google-cloud-storage
